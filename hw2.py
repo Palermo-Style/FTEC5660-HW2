@@ -68,6 +68,82 @@ async def load_mcp_tools() -> list[Any]:
     return await client.get_tools()
 
 
+VERIFIER_PROMPT = """\
+You verify one CV against the candidate's LinkedIn and Facebook profiles and
+report how reliable the CV is. The tools search and read those profiles.
+
+The CV text is extracted from a PDF. Some CVs arrive as plain lines and some as
+a markdown table whose words are split across many cells; read either form as
+one CV.
+
+Step 1 - find the right person.
+Names are shared by many people, and a search that finds no exact match falls
+back to unrelated people, so never trust a result just because the name matches.
+Search LinkedIn with the CV's name, the INDUSTRY taken from the CV headline (a
+headline like "Finance Professional" means industry "Finance"), and the CV's
+CITY as the location. Pass the city on its own ("Munich"), never
+"Munich, Germany" - the location filter matches a bare city or country and
+returns nothing for anything else. If that returns nothing, retry without the
+industry and then without the location.
+Read the profiles of the remaining candidates and keep the one whose companies,
+school and graduation year match the CV. A result with match_type "fuzzy", or
+one whose jobs and education share nothing with the CV, is somebody else - drop
+it. If no candidate matches the CV's employers and school, the CV cannot be
+validated, so score it low.
+
+Step 2 - check these fields one at a time and state the result of each.
+  - name
+  - city
+  - every job in the CV: company, title together with seniority, start year,
+    end year
+  - every education entry: degree, school, field, graduation year
+  - skills: write out the profile's skill list, then check EVERY skill the CV
+    lists against it one by one. A skill the CV lists that the profile does not
+    have is a discrepancy, even when all the other skills match.
+Job descriptions, the headline and the hometown are never discrepancies.
+
+Step 3 - decide.
+Wording differences are not discrepancies: "Bachelor of Science" is "BSc",
+"UI/UX Design" is "UI/UX", a CV title "Senior Engineer" matches a profile entry
+"Engineer" whose seniority is "senior", and a CV listing fewer skills than the
+profile is fine.
+A discrepancy is at least one false claim: an inflated job title, a shifted
+employment or graduation year, an upgraded degree, a school or employer the
+profile does not have, a wrong city, or a skill the candidate does not have.
+One discrepancy is enough.
+
+Give a short justification, then one final line and nothing after it:
+
+SCORE: <a number between 0 and 1>
+
+Use 0.9-1.0 when the CV matches, and 0.0-0.1 when you found a discrepancy.
+"""
+
+_SCORE_RE = re.compile(r"score\s*[:=]\s*(-?\d+(?:\.\d+)?)", re.IGNORECASE)
+_ANY_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def _read_score(message: Any) -> float | None:
+    """Return the final score from the agent's last message, if it gave one."""
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        content = "\n".join(
+            part if isinstance(part, str) else str(part.get("text", ""))
+            for part in content
+        )
+    text = str(content)
+    match = _SCORE_RE.search(text)
+    candidates = [match.group(1)] if match else _ANY_NUMBER_RE.findall(text)
+    for raw in reversed(candidates):
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if 0.0 <= value <= 1.0:
+            return value
+    return None
+
+
 def build_agent(tools: list[Any]) -> Any:
     """Create and return your agent once.
 
@@ -83,8 +159,13 @@ def build_agent(tools: list[Any]) -> Any:
     from .env.
     """
     ### YOUR CODE HERE
-    _ = tools
-    return None
+    from langchain.agents import create_agent
+    from langchain_deepseek import ChatDeepSeek
+
+    # No api_key argument: ChatDeepSeek reads DEEPSEEK_API_KEY from the
+    # environment, which load_env_file() has already filled from .env.
+    model = ChatDeepSeek(model=MODEL_NAME, temperature=0, timeout=300, max_retries=3)
+    return create_agent(model, tools, system_prompt=VERIFIER_PROMPT)
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
@@ -106,8 +187,25 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     shared by the whole class.
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    limit = asyncio.Semaphore(3)
+
+    async def one(name: str, text: str) -> tuple[str, float]:
+        async with limit:
+            try:
+                result = await agent.ainvoke(
+                    {"messages": [{"role": "user", "content": f"CV file: {name}\n\n{text}"}]}
+                )
+                score = _read_score(result["messages"][-1])
+                if score is None:
+                    print(f"warning: {name}: no score in the reply, using 0.5")
+            except Exception as error:  # one bad CV must not lose the whole run
+                print(f"warning: {name}: {type(error).__name__}: {error}")
+                score = None
+            final = 0.5 if score is None else score
+            print(f"{name}: {final:.2f}")
+            return name, final
+
+    return dict(await asyncio.gather(*(one(name, text) for name, text in cvs.items())))
 
 
 # Everything below is provided runner/scoring code. No edits are needed.

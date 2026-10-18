@@ -90,10 +90,51 @@ python3 hw2.py --cv-folder task2
 attack the MCP server. See the homework description for the full rules.
 
 ## Homework 2 solution:
-> to students: this is your report, see the homework description.
 
 ### Task 1
-> one paragraph describing your solution, and your results on `public_test`.
+
+`build_agent` creates a single tool-calling agent (`create_agent`) on
+`deepseek-v4-flash`, and its system prompt forces three steps. First it
+identifies the right person, because a name alone matches hundreds of profiles:
+it searches LinkedIn with the CV's name, the industry taken from the CV headline
+and the city on its own (the location filter rejects "Munich, Germany" and only
+accepts "Munich"), then keeps only the candidate whose companies, school and
+graduation year match the CV and discards fuzzy matches. Second it checks the
+comparable fields one at a time — name, city, every job's company, title with
+seniority, start and end year, every education entry's degree, school, field and
+graduation year, and every skill the CV lists against the profile's list one by
+one — while applying the wording tolerances the task allows (`BSc` =
+"Bachelor of Science", "Senior Engineer" = "Engineer" with seniority `senior`,
+fewer skills than the profile is fine). Third it answers with a single `SCORE:`
+line, which `score_cvs` parses. `score_cvs` runs the CVs through
+`asyncio.gather` behind an `asyncio.Semaphore(3)` so at most three are in
+flight, keeps every CV in its own `try`/`except`, and falls back to a score of
+0.5 when a reply cannot be read, so a single failure never loses the run. On
+`public_test` this scores **7/7 in five consecutive runs**, in under a minute
+per run.
 
 ### Task 2
-> the attack techniques you used and why you expect them to work.
+
+The attack leaves her real CV intact and adds exactly one fabricated detail
+inside the description of the AIA job: the header stays
+`Manager, AIA  2022 – Present`, and the first bullet reads
+`Promoted to Senior in 2024.` Name, city, all three employers with their titles,
+seniority and dates, the degree, school and graduation year, and the four
+skills all match her LinkedIn and Facebook records, so a verifier that walks the
+listed fields finds nothing to flag.
+
+It works because of how the comparison is specified, not because the model reads
+badly. The task restricts discrepancies to name, city, jobs, education and
+skills, and states that job descriptions, the headline and the hometown are
+never a source of a discrepancy because the profiles do not record them. A
+verifier that follows that specification parses the job header into a record,
+compares it against the profile, and skips the bullet below as description, so
+the promoted seniority never enters the comparison. The placement and the
+phrasing both matter: an inflated title in the header (`Senior Manager`) is
+caught at 0.05, `Promoted to Senior Finance Manager in 2024` still reads like a
+title claim and is caught in roughly half the runs, while `Promoted to Senior`
+stays inside the description and is not compared at all. Scored with our own
+Task 1 agent this CV gets **0.95–0.96 across three consecutive runs**, against
+**0.96–0.97** for her true CV, so the verifier cannot tell them apart. The
+residual risk is a verifier that reads every bullet and judges overstatement
+instead of following the field list.
